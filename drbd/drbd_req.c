@@ -2437,3 +2437,213 @@ void request_timer_fn(struct timer_list *t)
 		mod_timer(&device->request_timer, next_trigger_time);
 	}
 }
+
+/* in windrbd_device.c */
+NTSTATUS windrbd_make_dummy_drbd_write_request(struct block_device* dev, unsigned int total_size, sector_t sector, struct bio** _bio);
+
+static void drbd_send_dummy_write_and_submit(struct drbd_device* device, struct drbd_request* req)
+{
+	struct drbd_resource* resource = device->resource;
+	struct drbd_peer_device* peer_device = NULL; /* for read */
+	const int rw = bio_data_dir(req->master_bio);
+	struct bio_and_error m = { NULL, };
+	bool no_remote = false;
+	bool submit_private_bio = false;
+	KIRQL flags;
+
+	spin_lock_irqsave(&resource->req_lock, flags);
+	if (rw == WRITE) {
+		/* This may temporarily give up the req_lock,
+		 * but will re-acquire it before it returns here.
+		 * Needs to be before the check on drbd_suspended() */
+		complete_conflicting_writes(req, &flags);
+		/* no more giving up req_lock from now on! */
+
+		/* check for congestion, and potentially stop sending
+		 * full data updates, but start sending "dirty bits" only. */
+		maybe_pull_ahead(device);
+	}
+
+	if (drbd_suspended(device)) {
+		/* push back and retry: */
+		req->local_rq_state |= RQ_POSTPONED;
+		if (req->private_bio) {
+			bio_put(req->private_bio);
+			req->private_bio = NULL;
+			put_ldev(device);
+		}
+		goto out;
+	}
+
+	/* We fail READ early, if we can not serve it.
+	 * We must do this before req is registered on any lists.
+	 * Otherwise, drbd_req_complete() will queue failed READ for retry. */
+	if (rw != WRITE) {
+		peer_device = find_peer_device_for_read(req);
+		if (!peer_device && !req->private_bio)
+			goto nodata;
+	}
+
+	/* which transfer log epoch does this belong to? */
+	req->epoch = atomic_read(&resource->current_tle_nr);
+
+	if (rw == WRITE)
+		resource->dagtag_sector += req->i.size >> 9;
+	req->dagtag_sector = resource->dagtag_sector;
+	/* no point in adding empty flushes to the transfer log,
+	 * they are mapped to drbd barriers already. */
+	if (likely(req->i.size != 0)) {
+		if (rw == WRITE) {
+			struct drbd_request* req2;
+
+			resource->current_tle_writes++;
+			list_for_each_entry_reverse(struct drbd_request, req2, &resource->transfer_log, tl_requests) {
+				if (req2->local_rq_state & RQ_WRITE) {
+					/* Make the new write request depend on
+					 * the previous one. */
+					BUG_ON(req2->destroy_next);
+					req2->destroy_next = req;
+					kref_get(&req->kref);
+					break;
+				}
+			}
+		}
+		list_add_tail(&req->tl_requests, &resource->transfer_log);
+	}
+
+	if (rw == WRITE) {
+		if (req->private_bio && !may_do_writes(device)) {
+			bio_put(req->private_bio);
+			req->private_bio = NULL;
+			put_ldev(device);
+			goto nodata;
+		}
+		/* Need to replicate writes.  Unless it is an empty flush,
+		 * which is better mapped to a DRBD P_BARRIER packet,
+		 * also for drbd wire protocol compatibility reasons.
+		 * If this was a flush, just start a new epoch.
+		 * Unless the current epoch was empty anyways, or we are not currently
+		 * replicating, in which case there is no point. */
+		if (unlikely(req->i.size == 0)) {
+			/* The only size==0 bios we expect are empty flushes. */
+			D_ASSERT(device, req->master_bio->bi_opf & REQ_PREFLUSH);
+			_req_mod(req, QUEUE_AS_DRBD_BARRIER, NULL);
+		}
+#if 0
+		else if (!drbd_process_write_request(req))
+			no_remote = true;
+		wake_all_senders(resource);
+#else
+		else {	/* simulate remote connection broken */
+			no_remote = true;
+		}
+#endif
+	}
+	else {
+		if (peer_device) {
+			_req_mod(req, TO_BE_SENT, peer_device);
+			_req_mod(req, QUEUE_FOR_NET_READ, peer_device);
+			wake_up(&peer_device->connection->sender_work.q_wait);
+		}
+		else
+			no_remote = true;
+	}
+
+	if (no_remote == false) {
+		struct drbd_plug_cb* plug = drbd_check_plugged(resource);
+		if (plug)
+			drbd_update_plug(plug, req);
+	}
+
+	/* If it took the fast path in drbd_request_prepare, add it here.
+	 * The slow path has added it already. */
+	if (list_empty(&req->req_pending_master_completion))
+		list_add_tail(&req->req_pending_master_completion,
+			&device->pending_master_completion[rw == WRITE]);
+	if (req->private_bio) {
+		/* pre_submit_jif is used in request_timer_fn() */
+		req->pre_submit_jif = jiffies;
+		ktime_get_accounting(req->pre_submit_kt);
+		list_add_tail(&req->req_pending_local,
+			&device->pending_completion[rw == WRITE]);
+		_req_mod(req, TO_BE_SUBMITTED, NULL);
+		/* needs to be marked within the same spinlock
+		 * but we need to give up the spinlock to submit */
+		submit_private_bio = true;
+	}
+	else if (no_remote) {
+	nodata:
+		if (drbd_ratelimit()) {
+#pragma warning( push )
+#pragma warning (disable : 4457)
+			/* warning C4457: declaration of 'device' hides function parameter */
+			struct drbd_device* device = req->device;
+			drbd_err(device, "IO ERROR: neither local nor remote data, sector %llu+%u\n",
+				(unsigned long long)req->i.sector, req->i.size >> 9);
+#pragma warning( pop )
+		}
+		/* A write may have been queued for send_oos, however.
+		 * So we can not simply free it, we must go through drbd_req_put_completion_ref() */
+	}
+
+out:
+	drbd_req_put_completion_ref(req, &m, 1);
+	spin_unlock_irqrestore(&resource->req_lock, flags);
+
+	/* Even though above is a kref_put(), this is safe.
+	 * As long as we still need to submit our private bio,
+	 * we hold a completion ref, and the request cannot disappear.
+	 * If however this request did not even have a private bio to submit
+	 * (e.g. remote read), req may already be invalid now.
+	 * That's why we cannot check on req->private_bio. */
+#if 0
+	if (submit_private_bio)
+		drbd_submit_req_private_bio(req);
+	if (m.bio)
+		complete_master_bio(device, &m);
+#else
+	D_ASSERT(device, submit_private_bio);
+	D_ASSERT(device, m.bio == NULL);
+#endif
+}
+
+void test_sync_when_resync(struct drbd_device* device, unsigned int total_size, sector_t sector)
+{
+	NTSTATUS status;
+	struct bio* bio;
+#ifdef CONFIG_DRBD_TIMING_STATS
+	ktime_t start_kt;
+#endif
+	ULONG_PTR start_jif;
+	struct drbd_request* req;
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "test_sync_when_resync: %" PRIu64 " - %u IN\n", sector, total_size >> 9);
+
+	status = windrbd_make_dummy_drbd_write_request(device->this_bdev, total_size, sector, &bio);
+	if (status != STATUS_SUCCESS) {
+		return;
+	}
+
+	ktime_get_accounting(start_kt);
+	start_jif = jiffies;
+
+	// from __drbd_make_request
+	inc_ap_bio(device, bio_data_dir(bio));
+
+	req = drbd_request_prepare(device, bio, start_kt, start_jif);
+
+	if (IS_ERR_OR_NULL(req))
+		return;
+
+	D_ASSERT(device, req->private_bio);
+
+	drbd_send_dummy_write_and_submit(device, req);
+
+	atomic_set(&req->private_bio->bi_requests_completed, 0);
+	req->private_bio->bi_status = BLK_STS_OK;
+	req->private_bio->bi_using_big_buffer = false;
+
+	bio_endio(req->private_bio);
+
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "test_sync_with_resync OUT\n");
+}

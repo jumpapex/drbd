@@ -1523,6 +1523,7 @@ unsigned long _drbd_bm_find_next_zero(struct drbd_peer_device *peer_device, unsi
 unsigned int drbd_bm_set_bits(struct drbd_device *device, unsigned int bitmap_index,
 			      unsigned long start, unsigned long end)
 {
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "drbd_bm_set_bits: %" PRIu64 " --> %" PRIu64 "\n", start, end);
 	return bm_op(device, bitmap_index, start, end, BM_OP_SET, NULL);
 }
 
@@ -1604,6 +1605,7 @@ void drbd_bm_clear_all(struct drbd_device *device)
 unsigned int drbd_bm_clear_bits(struct drbd_device *device, unsigned int bitmap_index,
 				unsigned long start, unsigned long end)
 {
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "drbd_bm_clear_bits: %" PRIu64 "--> %" PRIu64 "\n", start, end);
 	return bm_op(device, bitmap_index, start, end, BM_OP_CLEAR, NULL);
 }
 

@@ -9020,6 +9020,9 @@ validate_req_change_req_state(struct drbd_peer_device *peer_device, u64 id, sect
 	return 0;
 }
 
+/* in drbd_req.c */
+void test_sync_when_resync(struct drbd_device* device, unsigned int total_size, sector_t sector);
+
 static int got_BlockAck(struct drbd_connection *connection, struct packet_info *pi)
 {
 	struct drbd_peer_device *peer_device;
@@ -9037,6 +9040,7 @@ static int got_BlockAck(struct drbd_connection *connection, struct packet_info *
 	update_peer_seq(peer_device, be32_to_cpu(p->seq_num));
 
 	if (p->block_id == ID_SYNCER) {
+		test_sync_when_resync(device, blksize, sector);
 		drbd_set_in_sync(peer_device, sector, blksize);
 		dec_rs_pending(peer_device);
 		atomic_sub(blksize >> 9, &connection->rs_in_flight);
